@@ -1,10 +1,77 @@
 from flask import Flask, render_template, request, jsonify
 import requests
+from bs4 import BeautifulSoup
 import time
 import os
+import re
 
 app = Flask(__name__)
-MANGADEX_API = "https://api.mangadex.org"
+HEADERS = {"User-Agent": "Mozilla/5.0 MK-MangaBot"}
+
+def proxy_img(url):
+    # wsrv.nl proxy to bypass blogger hotlink block
+    return f"https://wsrv.nl/?url={url}&w=1200&output=webp"
+
+# ===== SOURCE 1: MANGADEX =====
+def get_from_mangadex(url):
+    try:
+        manga_id = url.split("/title/")[1].split("/")[0]
+        manga_res = requests.get(f"https://api.mangadex.org/manga/{manga_id}?includes[]=author&includes[]=cover_art", headers=HEADERS, timeout=15)
+        manga = manga_res.json()['data']
+
+        title = manga['attributes']['title'].get('en', 'No Title')
+        desc = manga['attributes']['description'].get('en', 'No Description')
+        author = next((r['attributes']['name'] for r in manga['relationships'] if r['type']=='author'), 'Unknown')
+        cover_file = next((r['attributes']['fileName'] for r in manga['relationships'] if r['type']=='cover_art'), '')
+        cover = proxy_img(f"https://uploads.mangadex.org/covers/{manga_id}/{cover_file}") if cover_file else ""
+        status = manga['attributes']['status'].title()
+
+        chapters = []
+        offset = 0
+        while True:
+            chap_res = requests.get(f"https://api.mangadex.org/manga/{manga_id}/feed?limit=100&offset={offset}&order[chapter]=asc&translatedLanguage[]=en", headers=HEADERS, timeout=15)
+            data = chap_res.json()
+            for c in data['data']:
+                if c['attributes']['chapter']:
+                    chapters.append({'id': c['id'], 'num': c['attributes']['chapter'], 'title': c['attributes']['title'] or f"Chapter {c['attributes']['chapter']}", 'source': 'mangadex'})
+            offset += 100
+            if offset >= data['total']: break
+            time.sleep(0.2)
+        return {"title":title,"desc":desc,"author":author,"cover":cover,"status":status,"chapters":chapters}
+    except:
+        return None
+
+def get_chapter_images_mangadex(chap_id):
+    try:
+        at_home = requests.get(f"https://api.mangadex.org/at-home/server/{chap_id}", headers=HEADERS, timeout=15).json()
+        base = at_home['baseUrl']; hash = at_home['chapter']['hash']
+        return [proxy_img(f"{base}/data/{hash}/{p}") for p in at_home['chapter']['data']]
+    except: return []
+
+# ===== SOURCE 2: MANGAKALOT =====
+def get_from_kakalot(url):
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        title = soup.find('h1').text.strip()
+        cover = proxy_img(soup.find('img', class_='img-loading')['src'])
+        desc = soup.find('div', class_='story-detail-info-right').find('p').text.strip()
+        author = "Unknown"
+        status = "Ongoing"
+        chapters = []
+        for li in soup.find_all('div', class_='chapter-list')[0].find_all('a'):
+            chap_url = li['href']
+            chap_num = re.findall(r'chapter-([\d.]+)', chap_url)[0]
+            chapters.append({'id': chap_url, 'num': chap_num, 'title': li.text.strip(), 'source': 'kakalot'})
+        return {"title":title,"desc":desc,"author":author,"cover":cover,"status":status,"chapters":chapters[::-1]}
+    except: return None
+
+def get_chapter_images_kakalot(chap_url):
+    try:
+        res = requests.get(chap_url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        return [proxy_img(img['src']) for img in soup.find_all('img', class_='img-loading')]
+    except: return []
 
 @app.route("/")
 def home():
@@ -12,43 +79,25 @@ def home():
 
 @app.route("/fetch", methods=["POST"])
 def fetch():
-    try:
-        url = request.json.get("url")
-        manga_id = url.split("/title/")[1].split("/")[0]
+    url = request.json.get("url")
+    manga = None
+    source = ""
 
-        # Get manga info
-        manga_res = requests.get(f"{MANGADEX_API}/manga/{manga_id}?includes[]=author&includes[]=cover_art", timeout=15)
-        manga_data = manga_res.json()['data']
+    # Try MangaDex first
+    if "mangadex.org" in url:
+        manga = get_from_mangadex(url)
+        source = "mangadex"
 
-        title = manga_data['attributes']['title'].get('en', 'No Title')
-        desc = manga_data['attributes']['description'].get('en', 'No Description Available')
-        author = next((r['attributes']['name'] for r in manga_data['relationships'] if r['type']=='author'), 'Unknown')
-        cover_file = next((r['attributes']['fileName'] for r in manga_data['relationships'] if r['type']=='cover_art'), '')
-        cover = f"https://uploads.mangadex.org/covers/{manga_id}/{cover_file}.512.jpg" if cover_file else ""
-        status = manga_data['attributes']['status'].title()
+    # Fallback to Kakalot
+    if not manga:
+        manga = get_from_kakalot(url)
+        source = "kakalot"
 
-        # Get all chapters
-        chapters = []
-        offset = 0
-        while True:
-            chap_res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed?limit=100&offset={offset}&order[chapter]=asc&translatedLanguage[]=en&includes[]=scanlation_group", timeout=15)
-            data = chap_res.json()
-            for c in data['data']:
-                if c['attributes']['chapter']:
-                    chapters.append({
-                        'id': c['id'],
-                        'num': c['attributes']['chapter'],
-                        'title': c['attributes']['title'] or f"Chapter {c['attributes']['chapter']}"
-                    })
-            offset += 100
-            if offset >= data['total']:
-                break
-            time.sleep(0.3)
+    if not manga:
+        return jsonify({"success": False, "error": "Failed to fetch from all sources"})
 
-        return jsonify({"success": True, "title": title, "desc": desc, "author": author, "cover": cover, "status": status, "chapters": chapters})
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+    manga['source'] = source
+    return jsonify({"success": True, **manga})
 
 @app.route("/generate", methods=["POST"])
 def generate():
@@ -56,57 +105,29 @@ def generate():
         data = request.json
         manga = data['manga']
         selected_ids = data['chapters']
+        source = manga['source']
 
-        # Header + Cover
-        html = f"""<!-- MK MANGA BOT v2.0 -->
-<div class="mk-manga-wrapper">
-    <div class="mk-hero">
-        <img src="{manga['cover']}" class="mk-cover" alt="{manga['title']}">
-        <div class="mk-info">
-            <h1>{manga['title']}</h1>
-            <p><b>Author:</b> {manga['author']} | <b>Status:</b> {manga['status']}</p>
-            <p class="mk-desc">{manga['desc']}</p>
-        </div>
-    </div>"""
+        html = f"""<div class="mk-manga-wrapper"><div class="mk-hero"><img src="{manga['cover']}" class="mk-cover"><div class="mk-info"><h1>{manga['title']}</h1><p><b>Author:</b> {manga['author']} | <b>Status:</b> {manga['status']}</p><p class="mk-desc">{manga['desc']}</p></div></div>"""
 
-        # Loop chapters and get images with proxy to avoid CORS
         for chap_id in selected_ids:
             chap = next(c for c in manga['chapters'] if c['id']==chap_id)
 
-            # Get chapter images from MangaDex@Home
-            at_home = requests.get(f"{MANGADEX_API}/at-home/server/{chap_id}", timeout=15).json()
-            base = at_home['baseUrl']
-            hash = at_home['chapter']['hash']
+            # Get images based on source
+            if source == 'mangadex':
+                pages = get_chapter_images_mangadex(chap_id)
+            else:
+                pages = get_chapter_images_kakalot(chap_id)
 
-            # Use proxy so Blogger can load images
-            pages = []
-            for p in at_home['chapter']['data']:
-                img_url = f"{base}/data/{hash}/{p}"
-                proxy_url = f"https://mangadex.org/_next/image?url={img_url}&w=1920&q=75"
-                pages.append(f'<img src="{proxy_url}" loading="lazy" alt="Page">')
-
-            imgs = "".join(pages)
+            imgs = "".join([f'<img src="{p}" loading="lazy">' for p in pages])
             html += f"""<div class="mk-chapter"><h3>Chapter {chap['num']}: {chap['title']}</h3><div class="mk-reader">{imgs}</div></div>"""
-            time.sleep(0.8) # avoid rate limit
+            time.sleep(1)
 
-        html += """<div class="mk-footer"><p>Read more at <a href="https://mk-playz.blogspot.com" style="color:#f5c518">MK_PLAYZ</a></p></div></div>"""
-
-        # CSS
-        html += """<style>
-       .mk-manga-wrapper{max-width:900px;margin:20px auto;background:#0d1117;color:#e6edf3;padding:20px;font-family:Arial;border-radius:12px}
-       .mk-hero{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:30px}
-       .mk-cover{width:250px;border-radius:8px;box-shadow:0 4px 15px rgba(0,0,0,0.5)}
-       .mk-info h1{color:#f5c518;margin-top:0}
-       .mk-desc{line-height:1.6;color:#b1bac4}
-       .mk-chapter{background:#161b22;padding:20px;margin:20px 0;border-radius:8px;border:1px solid #30363d}
-       .mk-chapter h3{color:#f5c518;border-bottom:1px solid #30363d;padding-bottom:10px}
-       .mk-reader img{width:100%;margin:8px 0;border-radius:4px}
-       .mk-footer{text-align:center;margin-top:30px;padding-top:20px;border-top:1px solid #30363d;color:#8b949e}
-        @media(max-width:768px){.mk-hero{flex-direction:column}.mk-cover{width:100%}}
-        </style>"""
-
+        html += """<div class="mk-footer"><p>Powered by MK_BOTS</p></div></div>"""
+        html += """<style>.mk-manga-wrapper{max-width:900px;margin:20px auto;background:#0d1117;color:#e6edf3;padding:20px;font-family:Arial;border-radius:12px}
+      .mk-hero{display:flex;gap:20px;flex-wrap:wrap}.mk-cover{width:250px;border-radius:8px}
+      .mk-info h1{color:#f5c518}.mk-chapter{background:#161b22;padding:20px;margin:20px 0;border-radius:8px}
+      .mk-chapter h3{color:#f5c518}.mk-reader img{width:100%;margin:8px 0;border-radius:4px}</style>"""
         return jsonify({"success": True, "code": html})
-
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
